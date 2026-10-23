@@ -45,6 +45,8 @@ const float LANDING_STABLE_BAND_M = 0.30f;
 const uint16_t LANDING_STABLE_SAMPLES = 30;
 const float LANDING_MIN_DROP_M = 2.0f;
 
+
+
 #define MAGIC 0x4D425954UL
 #define VERSION 1
 
