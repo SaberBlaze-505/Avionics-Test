@@ -1,384 +1,272 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <SPI.h>
-#include <LoRa.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
 #include <Adafruit_BMP280.h>
+#include <TinyGPSPlus.h>
 #include <math.h>
 
-// =====================================================
-//  AVIONICS SENSOR & LORA TELEMETRY + FLIGHT STATE
-//
-//  Packet LoRa (1 baris, pemisah ";"):
-//    state;timestamp;ax;ay;az;gx;gy;gz;imuTemp;bmpTemp;pressure;altitude
-//    State (0-4) selalu di awal dan ikut terkirim di setiap paket.
-//
-//  State:
-//    0 = STARTUP : kalibrasi semua sensor
-//    1 = ARMING  : kalibrasi selesai, sensor terbaca,
-//                  telemetry LoRa sudah berjalan
-//    2 = BOOST   : ketinggian naik pesat & stabil
-//    3 = APOGEE  : 25 sampel turun berturut-turut
-//                  -> GPIO26 (MOSFET_SIGNAL) HIGH
-//    4 = LANDING : data ketinggian relatif stabil
-// =====================================================
-
-
-// I2C
+// ---------- HARDWARE ----------
 #define SDA_PIN 21
 #define SCL_PIN 22
 
-#define IMU_ADDR 0x68
-#define BMP_ADDR 0x76
+// NEO-6M UART2: GPS TX -> ESP32 RX, GPS RX -> ESP32 TX.
+#define GPS_ENABLED 1
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
+#define GPS_BAUD_RATE 9600
+#define GPS_MAX_AGE_MS 3000
 
-// LoRa SX1278
-#define LORA_SCK  18
-#define LORA_MISO 19
-#define LORA_MOSI 23
+// ---------- ESP-NOW ----------
+#define ESPNOW_CHANNEL 1
+#define SENSOR_UPDATE_INTERVAL_MS 100
+#define SEND_INTERVAL_MS 1000
+#define DISCOVERY_INTERVAL_MS 1000
+#define TELEMETRY_VERSION 2
 
-#define LORA_CS   5
-#define LORA_RST  14
-#define LORA_DIO0 32
-
-#define LORA_FREQUENCY 433500000L
-
-// Test LED (sinyal apogee)
 #define MOSFET_SIGNAL 26
-
-// =====================================================
-// SYSTEM TIMING
-// =====================================================
-
-const uint32_t SENSOR_INTERVAL_MS = 100;     // 10 Hz
-const uint32_t TELEMETRY_INTERVAL_MS = 200;  // 5 Hz
-
-// =====================================================
-// CALIBRATION SETTINGS
-// =====================================================
 
 const uint16_t IMU_CAL_SAMPLES = 250;
 const uint16_t IMU_CAL_DELAY_MS = 10;
-
 const uint16_t BMP_CAL_SAMPLES = 40;
 const uint16_t BMP_CAL_DELAY_MS = 120;
 
 const float GRAVITY = 9.80665f;
-
-// =====================================================
-// KALMAN FILTER SETTINGS
-// =====================================================
-
-const float KALMAN_Q = 0.6f;
-const float KALMAN_R = 1.5f;
-
-// =====================================================
-// FLIGHT STATE SETTINGS  (sesuaikan saat uji)
-// =====================================================
-
-enum FlightState : uint8_t
-{
-    STATE_STARTUP = 0,
-    STATE_ARMING  = 1,
-    STATE_BOOST   = 2,
-    STATE_APOGEE  = 3,
-    STATE_LANDING = 4
-};
-
-// --- Boost ---
-// Naik lebih cepat dari ini (m/s) ...
-const float    BOOST_VELOCITY_MPS     = 3.0f;
-// ... selama sekian sampel berturut-turut (10 Hz -> 0.5 s)
-const uint8_t  BOOST_CONFIRM_SAMPLES  = 5;
-// Dan ketinggian minimal di atas titik nol (m)
-const float    BOOST_MIN_ALTITUDE_M   = 1.0f;
-
-// --- Apogee ---
-// Jumlah penurunan berturut-turut
-const uint8_t  APOGEE_DESCENT_SAMPLES = 25;
-// Perubahan lebih kecil dari ini dianggap noise (m)
-const float    ALTITUDE_DEADBAND_M    = 0.02f;
-
-// --- LED apogee ---
-// Lama GPIO26 (MOSFET_SIGNAL) menyala HIGH saat apogee (ms)
-const uint32_t APOGEE_MOSFET_DURATION_MS = 3000;
-
-// --- Landing ---
-// Perubahan antar sampel dianggap "stabil" jika < band (m)
-const float    LANDING_STABLE_BAND_M  = 0.30f;
-// Stabil selama sekian sampel berturut-turut (10 Hz -> 3 s)
+const float ALTITUDE_KALMAN_Q = 0.6f;
+const float ALTITUDE_KALMAN_R = 1.5f;
+const float BOOST_VELOCITY_MPS = 3.0f;
+const uint8_t BOOST_CONFIRM_SAMPLES = 5;
+const float BOOST_MIN_ALTITUDE_M = 1.0f;
+const uint8_t APOGEE_DESCENT_SAMPLES = 25;
+const float ALTITUDE_DEADBAND_M = 0.02f;
+const uint32_t APOGEE_SIGNAL_DURATION_MS = 3000;
+const float LANDING_STABLE_BAND_M = 0.30f;
 const uint16_t LANDING_STABLE_SAMPLES = 30;
-// Minimal sudah turun sekian meter dari puncak
-const float    LANDING_MIN_DROP_M     = 2.0f;
+const float LANDING_MIN_DROP_M = 2.0f;
 
-// =====================================================
-// TIMERS
-// =====================================================
+#define MAGIC 0x4D425954UL
+#define VERSION 1
 
-uint32_t lastSensorTime = 0;
-uint32_t lastTelemetryTime = 0;
-uint32_t lastKalmanTime = 0;
+#define MSG_DISCOVERY 1
+#define MSG_RESPONSE  2
+#define MSG_TELEMETRY 3
 
-// =====================================================
-// SENSOR OBJECTS
-// =====================================================
+#define FLAG_MPU_VALID 0x01
+#define FLAG_BMP_VALID 0x02
+#define FLAG_GPS_VALID 0x04
+#define FLAG_ALTITUDE_VALID 0x08
 
-Adafruit_BMP280 bmp;
-
-uint8_t imuChipID = 0;
-
-bool sensorDataValid = false;
-
-// =====================================================
-// FLIGHT STATE VARIABLES
-// =====================================================
-
-FlightState flightState = STATE_STARTUP;
-
-bool stateRefValid = false;
-float prevStateAltitude = 0.0f;
-uint32_t prevStateTime = 0;
-float maxAltitude = 0.0f;
-
-uint8_t boostCount = 0;
-uint8_t descentCount = 0;
-uint16_t stableCount = 0;
-
-bool apogeeLedActive = false;
-uint32_t apogeeLedStartTime = 0;
-
-// =====================================================
-// IMU CALIBRATION VARIABLES
-// =====================================================
-
-float gyroBiasX = 0.0f;
-float gyroBiasY = 0.0f;
-float gyroBiasZ = 0.0f;
-
-float accelBiasX = 0.0f;
-float accelBiasY = 0.0f;
-float accelBiasZ = 0.0f;
-
-bool gyroCalibrated = false;
-bool accelCalibrated = false;
-
-// =====================================================
-// BAROMETER CALIBRATION
-// =====================================================
-
-float pressureZeroPa = 0.0f;
-
-bool altitudeCalibrated = false;
-
-// =====================================================
-// KALMAN FILTER STATE
-// =====================================================
-
-float kalmanAltitude = 0.0f;
-float kalmanP = 1.0f;
-
-bool kalmanInitialized = false;
-
-// =====================================================
-// SENSOR DATA STRUCTURE
-// =====================================================
-
-struct SensorData
-{
-    uint32_t timestamp;
-
-    float ax;
-    float ay;
-    float az;
-
-    float gx;
-    float gy;
-    float gz;
-
-    float mpuTemp;
-    float bmpTemp;
-
-    float pressure;
-
-    float rawAltitude;
-    float filteredAltitude;
+// ---------- PACKETS ----------
+struct __attribute__((packed)) ControlMessage {
+    uint32_t magic;
+    uint8_t type;
+    uint8_t version;
 };
 
-SensorData sensor = {};
+struct __attribute__((packed)) TelemetryPacket {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t sequence;
+    uint32_t uptime_ms;
 
-struct RawIMU
-{
     int16_t ax;
     int16_t ay;
     int16_t az;
 
-    int16_t temperature;
-
     int16_t gx;
     int16_t gy;
     int16_t gz;
+
+    int16_t temperature_centi_c;
+    uint32_t pressure_pa;
+
+    int32_t latitude_e7;
+    int32_t longitude_e7;
+    int32_t gps_altitude_cm;
+    uint8_t gps_satellites;
+
+    uint8_t flags;
+    uint8_t flight_state;
+    int32_t relative_altitude_cm;
+    int16_t mpu_temperature_centi_c;
 };
 
-// =====================================================
-// I2C REGISTER WRITE
-// =====================================================
+static_assert(sizeof(ControlMessage) == 6,
+              "ControlMessage size mismatch");
 
-bool imuWrite(uint8_t reg, uint8_t value)
-{
-    Wire.beginTransmission(IMU_ADDR);
+static_assert(sizeof(TelemetryPacket) == 51,
+              "TelemetryPacket size mismatch");
 
+enum FlightState : uint8_t {
+    STATE_STARTUP = 0,
+    STATE_ARMING = 1,
+    STATE_BOOST = 2,
+    STATE_APOGEE = 3,
+    STATE_LANDING = 4
+};
+
+// ---------- I2C SENSORS ----------
+Adafruit_BMP280 bmp;
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
+const uint8_t MPU_CANDIDATES[] = {0x68, 0x69};
+
+uint8_t mpuAddress = 0;
+bool mpuInitialized = false;
+bool bmpInitialized = false;
+bool gpsInitialized = false;
+uint8_t mpuChipId = 0;
+
+// ---------- ESP-NOW STATE ----------
+uint8_t broadcastMAC[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+uint8_t receiverMAC[6] = {0};
+bool receiverConnected = false;
+
+volatile bool responsePending = false;
+portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+
+uint16_t sequenceNumber = 0;
+
+unsigned long lastDiscovery = 0;
+unsigned long lastSensorUpdate = 0;
+unsigned long lastSend = 0;
+
+struct KalmanFilter {
+    float estimate = 0.0f;
+    float covariance = 1.0f;
+    bool initialized = false;
+};
+
+KalmanFilter accelFilters[3];
+KalmanFilter gyroFilters[3];
+KalmanFilter temperatureFilter;
+KalmanFilter pressureFilter;
+KalmanFilter mpuTemperatureFilter;
+
+int16_t filteredAccel[3] = {0};
+int16_t filteredGyro[3] = {0};
+int16_t filteredTemperature = 0;
+uint32_t filteredPressure = 0;
+bool filteredMPUValid = false;
+bool filteredBMPValid = false;
+float filteredMpuTemperature = NAN;
+
+float gyroBiasRaw[3] = {0.0f};
+float accelBiasRaw[3] = {0.0f};
+float pressureZeroPa = 0.0f;
+bool gyroCalibrated = false;
+bool altitudeCalibrated = false;
+
+FlightState flightState = STATE_STARTUP;
+bool stateReferenceValid = false;
+float previousStateAltitude = 0.0f;
+uint32_t previousStateTime = 0;
+float maximumAltitude = 0.0f;
+uint8_t boostCount = 0;
+uint8_t descentCount = 0;
+uint16_t stableCount = 0;
+bool apogeeSignalActive = false;
+uint32_t apogeeSignalStartTime = 0;
+
+float filteredAltitude = 0.0f;
+float altitudeCovariance = 1.0f;
+bool altitudeFilterInitialized = false;
+uint32_t lastAltitudeFilterTime = 0;
+
+void updateFlightState(uint32_t now);
+
+// ---------- I2C HELPERS ----------
+bool devicePresent(uint8_t address) {
+    Wire.beginTransmission(address);
+    return Wire.endTransmission() == 0;
+}
+
+bool writeMPURegister(uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(mpuAddress);
     Wire.write(reg);
     Wire.write(value);
-
-    return Wire.endTransmission(true) == 0;
+    return Wire.endTransmission() == 0;
 }
 
-// =====================================================
-// I2C REGISTER READ
-// =====================================================
-
-bool imuReadBytes(
-    uint8_t reg,
-    uint8_t *buffer,
-    uint8_t length
-)
-{
-    Wire.beginTransmission(IMU_ADDR);
-
+bool readMPURegister(uint8_t reg, uint8_t &value) {
+    Wire.beginTransmission(mpuAddress);
     Wire.write(reg);
 
-    if (Wire.endTransmission(false) != 0)
-    {
+    if (Wire.endTransmission(false) != 0) {
         return false;
     }
 
-    uint8_t received = Wire.requestFrom(
-        (uint8_t)IMU_ADDR,
-        length,
-        (uint8_t)true
-    );
-
-    if (received != length)
-    {
+    if (Wire.requestFrom(mpuAddress, (uint8_t)1) != 1) {
         return false;
     }
 
-    for (uint8_t i = 0; i < length; i++)
-    {
-        buffer[i] = Wire.read();
-    }
-
+    value = Wire.read();
     return true;
 }
 
-int16_t combineBytes(uint8_t highByte, uint8_t lowByte)
-{
-    uint16_t value =
-        ((uint16_t)highByte << 8) | lowByte;
+// ---------- SENSOR INITIALIZATION ----------
+void initializeMPU() {
+    Serial.println("\nSearching for MPU6050-compatible sensor...");
 
-    return (int16_t)value;
-}
-
-bool readIMURaw(RawIMU &raw)
-{
-    uint8_t d[14];
-
-    if (!imuReadBytes(0x3B, d, 14))
-    {
-        return false;
+    for (uint8_t address : MPU_CANDIDATES) {
+        if (devicePresent(address)) {
+            mpuAddress = address;
+            break;
+        }
     }
 
-    raw.ax = combineBytes(d[0], d[1]);
-    raw.ay = combineBytes(d[2], d[3]);
-    raw.az = combineBytes(d[4], d[5]);
-
-    raw.temperature = combineBytes(d[6], d[7]);
-
-    raw.gx = combineBytes(d[8], d[9]);
-    raw.gy = combineBytes(d[10], d[11]);
-    raw.gz = combineBytes(d[12], d[13]);
-
-    return true;
-}
-
-// =====================================================
-// INITIALIZE IMU
-// =====================================================
-
-bool initializeIMU()
-{
-    if (!imuReadBytes(0x75, &imuChipID, 1))
-    {
-        Serial.println("# ERROR: IMU not responding");
-        return false;
+    if (mpuAddress == 0) {
+        Serial.println("MPU not found at 0x68 or 0x69.");
+        mpuInitialized = false;
+        return;
     }
 
-    Serial.print("# IMU WHO_AM_I: 0x");
-    Serial.println(imuChipID, HEX);
-
-    if (imuChipID != 0x68 &&
-        imuChipID != 0x70 &&
-        imuChipID != 0x72)
-    {
-        Serial.println("# ERROR: Unsupported IMU ID");
-        return false;
+    if (readMPURegister(0x75, mpuChipId)) {
+        Serial.printf("MPU address: 0x%02X\n", mpuAddress);
+        Serial.printf("WHO_AM_I: 0x%02X\n", mpuChipId);
     }
 
-    if (imuChipID == 0x72)
-    {
-        Serial.println("# WARNING: Unknown IMU ID 0x72");
-        Serial.println("# Using experimental register compatibility");
+    // Wake the sensor. Do not reject compatible clones solely
+    // because their WHO_AM_I value differs from 0x68.
+    if (!writeMPURegister(0x6B, 0x00)) {
+        Serial.println("Failed to wake MPU.");
+        mpuInitialized = false;
+        return;
     }
 
-    // Wake up IMU
-    if (!imuWrite(0x6B, 0x00))
-    {
-        return false;
+    if (!writeMPURegister(0x1C, 0x18) ||
+        !writeMPURegister(0x1B, 0x18) ||
+        !writeMPURegister(0x1A, 0x04)) {
+        Serial.println("Failed to configure MPU measurement ranges.");
+        mpuInitialized = false;
+        return;
     }
 
     delay(100);
 
-    // Accelerometer +/-16g
-    if (!imuWrite(0x1C, 0x18))
-    {
-        return false;
-    }
-
-    // Gyroscope +/-2000 deg/s
-    if (!imuWrite(0x1B, 0x18))
-    {
-        return false;
-    }
-
-    // Digital low-pass filter
-    if (!imuWrite(0x1A, 0x04))
-    {
-        return false;
-    }
-
-    delay(100);
-
-    Serial.println("# IMU initialized");
-
-    return true;
+    mpuInitialized = true;
+    Serial.println("MPU initialized.");
 }
 
-// =====================================================
-// INITIALIZE BMP280
-// =====================================================
+void initializeBMP() {
+    Serial.println("\nSearching for BMP280...");
 
-bool initializeBMP()
-{
-    bool found = bmp.begin(BMP_ADDR, 0x58);
-
-    if (!found)
-    {
-        found = bmp.begin(0x77, 0x58);
-    }
-
-    if (!found)
-    {
-        Serial.println("# ERROR: BMP280 not detected");
-        return false;
-    }
+if (bmp.begin(0x76)) {
+    bmpInitialized = true;
+    Serial.println("BMP280 found at 0x76.");
+} else if (bmp.begin(0x77)) {
+    bmpInitialized = true;
+    Serial.println("BMP280 found at 0x77.");
+} else {
+    bmpInitialized = false;
+    Serial.println("BMP280 not found.");
+    return;
+}
 
     bmp.setSampling(
         Adafruit_BMP280::MODE_NORMAL,
@@ -387,534 +275,320 @@ bool initializeBMP()
         Adafruit_BMP280::FILTER_X16,
         Adafruit_BMP280::STANDBY_MS_1
     );
-
-    delay(300);
-
-    Serial.println("# BMP280 initialized");
-
-    return true;
 }
 
-// =====================================================
-// INITIALIZE LORA
-// =====================================================
+void initializeGPS() {
+#if GPS_ENABLED
+    gpsSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    gpsInitialized = true;
+    Serial.printf("NEO-6M UART2 started at %lu baud (RX=%d, TX=%d).\n",
+                  (unsigned long)GPS_BAUD_RATE, GPS_RX_PIN, GPS_TX_PIN);
+#else
+    gpsInitialized = false;
+    Serial.println("GPS disabled (GPS_ENABLED=0).");
+#endif
+}
 
-bool initializeLoRa()
-{
-    SPI.begin(
-        LORA_SCK,
-        LORA_MISO,
-        LORA_MOSI,
-        LORA_CS
-    );
+void updateGPS() {
+#if GPS_ENABLED
+    while (gpsSerial.available() > 0) {
+        gps.encode(gpsSerial.read());
+    }
+#endif
+}
 
-    LoRa.setPins(
-        LORA_CS,
-        LORA_RST,
-        LORA_DIO0
-    );
+// ---------- ESP-NOW HELPERS ----------
+bool addPeer(const uint8_t *mac) {
+    if (esp_now_is_peer_exist(mac)) {
+        return true;
+    }
 
-    if (!LoRa.begin(LORA_FREQUENCY))
-    {
-        Serial.println("# ERROR: LoRa initialization failed");
+    esp_now_peer_info_t peer = {};
+    memcpy(peer.peer_addr, mac, 6);
+    peer.channel = ESPNOW_CHANNEL;
+    peer.encrypt = false;
+    peer.ifidx = WIFI_IF_STA;
+
+    esp_err_t result = esp_now_add_peer(&peer);
+
+    if (result != ESP_OK) {
+        Serial.printf("Failed to add peer: %s\n",
+                      esp_err_to_name(result));
         return false;
     }
 
-    LoRa.setSpreadingFactor(7);
-    LoRa.setSignalBandwidth(125000);
-    LoRa.setCodingRate4(5);
+    return true;
+}
 
-    LoRa.setPreambleLength(12);
-    LoRa.setSyncWord(0x12);
+// Older Arduino-ESP32 core 2.x callback signature.
+void onReceive(const uint8_t *mac,
+               const uint8_t *data,
+               int len) {
+    if (len != sizeof(ControlMessage)) {
+        return;
+    }
 
-    LoRa.enableCrc();
+    ControlMessage msg;
+    memcpy(&msg, data, sizeof(msg));
 
-    LoRa.setTxPower(8);
+    if (msg.magic != MAGIC ||
+        msg.version != VERSION ||
+        msg.type != MSG_RESPONSE) {
+        return;
+    }
 
-    Serial.println("# LoRa initialized");
-    Serial.println("# Frequency: 433.5 MHz");
+    portENTER_CRITICAL(&mux);
+    memcpy(receiverMAC, mac, 6);
+    responsePending = true;
+    portEXIT_CRITICAL(&mux);
+}
+
+void processDiscoveryResponse() {
+    uint8_t discoveredMAC[6];
+    bool pending = false;
+
+    portENTER_CRITICAL(&mux);
+
+    if (responsePending) {
+        memcpy(discoveredMAC, receiverMAC, 6);
+        responsePending = false;
+        pending = true;
+    }
+
+    portEXIT_CRITICAL(&mux);
+
+    if (!pending) {
+        return;
+    }
+
+    if (!addPeer(discoveredMAC)) {
+        Serial.println("Could not add discovered receiver.");
+        return;
+    }
+
+    memcpy(receiverMAC, discoveredMAC, 6);
+    receiverConnected = true;
+
+    Serial.printf(
+        "\nReceiver discovered: "
+        "%02X:%02X:%02X:%02X:%02X:%02X\n",
+        receiverMAC[0], receiverMAC[1], receiverMAC[2],
+        receiverMAC[3], receiverMAC[4], receiverMAC[5]
+    );
+}
+
+// ---------- MPU READING ----------
+bool readMPU(int16_t &ax, int16_t &ay, int16_t &az,
+             int16_t &gx, int16_t &gy, int16_t &gz,
+             int16_t &temperature) {
+    if (!mpuInitialized) {
+        return false;
+    }
+
+    Wire.beginTransmission(mpuAddress);
+    Wire.write(0x3B);
+
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+
+    if (Wire.requestFrom(mpuAddress, (uint8_t)14) != 14) {
+        return false;
+    }
+
+    ax = (int16_t)((Wire.read() << 8) | Wire.read());
+    ay = (int16_t)((Wire.read() << 8) | Wire.read());
+    az = (int16_t)((Wire.read() << 8) | Wire.read());
+
+    temperature = (int16_t)((Wire.read() << 8) | Wire.read());
+
+    gx = (int16_t)((Wire.read() << 8) | Wire.read());
+    gy = (int16_t)((Wire.read() << 8) | Wire.read());
+    gz = (int16_t)((Wire.read() << 8) | Wire.read());
 
     return true;
 }
 
-// =====================================================
-// IMU STATIONARY CALIBRATION
-// =====================================================
+float updateKalman(KalmanFilter &filter, float measurement,
+                   float processNoise, float measurementNoise) {
+    if (!filter.initialized) {
+        filter.estimate = measurement;
+        filter.initialized = true;
+        return filter.estimate;
+    }
 
-bool calibrateIMU()
-{
-    Serial.println();
-    Serial.println("# Starting IMU calibration");
-    Serial.println("# Keep the board completely stationary");
-    Serial.println("# Place it flat on one face if possible");
+    filter.covariance += processNoise;
+    float gain = filter.covariance /
+                 (filter.covariance + measurementNoise);
+    filter.estimate += gain * (measurement - filter.estimate);
+    filter.covariance *= 1.0f - gain;
+    return filter.estimate;
+}
 
-    gyroBiasX = 0.0f;
-    gyroBiasY = 0.0f;
-    gyroBiasZ = 0.0f;
+bool calibrateMPU() {
+    if (!mpuInitialized) return false;
 
-    accelBiasX = 0.0f;
-    accelBiasY = 0.0f;
-    accelBiasZ = 0.0f;
+    Serial.println("\nKeep the MPU stationary for calibration...");
+    double accelSum[3] = {0.0, 0.0, 0.0};
+    double gyroSum[3] = {0.0, 0.0, 0.0};
+    float gyroMinimum[3] = {INFINITY, INFINITY, INFINITY};
+    float gyroMaximum[3] = {-INFINITY, -INFINITY, -INFINITY};
 
-    gyroCalibrated = false;
-    accelCalibrated = false;
-
-    double sumAx = 0.0;
-    double sumAy = 0.0;
-    double sumAz = 0.0;
-
-    double sumGx = 0.0;
-    double sumGy = 0.0;
-    double sumGz = 0.0;
-
-    float minGx = INFINITY;
-    float minGy = INFINITY;
-    float minGz = INFINITY;
-
-    float maxGx = -INFINITY;
-    float maxGy = -INFINITY;
-    float maxGz = -INFINITY;
-
-    RawIMU raw;
-
-    for (uint16_t i = 0; i < IMU_CAL_SAMPLES; i++)
-    {
-        if (!readIMURaw(raw))
-        {
-            Serial.println("# ERROR: IMU calibration read failed");
+    for (uint16_t sample = 0; sample < IMU_CAL_SAMPLES; sample++) {
+        int16_t ax, ay, az, gx, gy, gz, temperature;
+        if (!readMPU(ax, ay, az, gx, gy, gz, temperature)) {
+            Serial.println("MPU calibration read failed.");
             return false;
         }
 
-        sumAx += raw.ax;
-        sumAy += raw.ay;
-        sumAz += raw.az;
-
-        sumGx += raw.gx;
-        sumGy += raw.gy;
-        sumGz += raw.gz;
-
-        float gx = raw.gx / 16.4f;
-        float gy = raw.gy / 16.4f;
-        float gz = raw.gz / 16.4f;
-
-        minGx = fminf(minGx, gx);
-        minGy = fminf(minGy, gy);
-        minGz = fminf(minGz, gz);
-
-        maxGx = fmaxf(maxGx, gx);
-        maxGy = fmaxf(maxGy, gy);
-        maxGz = fmaxf(maxGz, gz);
-
+        const int16_t accel[3] = {ax, ay, az};
+        const int16_t gyro[3] = {gx, gy, gz};
+        for (uint8_t axis = 0; axis < 3; axis++) {
+            accelSum[axis] += accel[axis];
+            gyroSum[axis] += gyro[axis];
+            float rateDps = gyro[axis] / 16.4f;
+            gyroMinimum[axis] = fminf(gyroMinimum[axis], rateDps);
+            gyroMaximum[axis] = fmaxf(gyroMaximum[axis], rateDps);
+        }
         delay(IMU_CAL_DELAY_MS);
     }
 
-    // ---------- Gyroscope bias ----------
+    bool stableGyro = true;
+    for (uint8_t axis = 0; axis < 3; axis++) {
+        stableGyro &= gyroMaximum[axis] - gyroMinimum[axis] < 8.0f;
+        gyroBiasRaw[axis] = gyroSum[axis] / IMU_CAL_SAMPLES;
+    }
 
-    float candidateGx = (sumGx / IMU_CAL_SAMPLES) / 16.4f;
-    float candidateGy = (sumGy / IMU_CAL_SAMPLES) / 16.4f;
-    float candidateGz = (sumGz / IMU_CAL_SAMPLES) / 16.4f;
-
-    bool stableGyro =
-        (maxGx - minGx < 8.0f) &&
-        (maxGy - minGy < 8.0f) &&
-        (maxGz - minGz < 8.0f);
-
-    if (stableGyro)
-    {
-        gyroBiasX = candidateGx;
-        gyroBiasY = candidateGy;
-        gyroBiasZ = candidateGz;
-
+    if (stableGyro) {
         gyroCalibrated = true;
-
-        Serial.println("# Gyroscope bias calibrated");
-    }
-    else
-    {
-        Serial.println("# WARNING: Gyroscope motion detected");
-        Serial.println("# Gyroscope calibration skipped");
+        Serial.println("Gyroscope bias calibrated.");
+    } else {
+        memset(gyroBiasRaw, 0, sizeof(gyroBiasRaw));
+        Serial.println("Gyroscope moved during calibration; bias correction skipped.");
     }
 
-    // ---------- Accelerometer single-position offset ----------
-
-    float avgAx = (sumAx / IMU_CAL_SAMPLES) * (GRAVITY / 2048.0f);
-    float avgAy = (sumAy / IMU_CAL_SAMPLES) * (GRAVITY / 2048.0f);
-    float avgAz = (sumAz / IMU_CAL_SAMPLES) * (GRAVITY / 2048.0f);
+    float averageAccel[3];
+    for (uint8_t axis = 0; axis < 3; axis++) {
+        averageAccel[axis] = (accelSum[axis] / IMU_CAL_SAMPLES) *
+                             (GRAVITY / 2048.0f);
+    }
 
     float magnitude = sqrtf(
-        avgAx * avgAx +
-        avgAy * avgAy +
-        avgAz * avgAz
-    );
-
-    float absX = fabsf(avgAx);
-    float absY = fabsf(avgAy);
-    float absZ = fabsf(avgAz);
-
+        averageAccel[0] * averageAccel[0] +
+        averageAccel[1] * averageAccel[1] +
+        averageAccel[2] * averageAccel[2]);
     uint8_t gravityAxis = 0;
-    float largest = absX;
+    if (fabsf(averageAccel[1]) > fabsf(averageAccel[gravityAxis])) gravityAxis = 1;
+    if (fabsf(averageAccel[2]) > fabsf(averageAccel[gravityAxis])) gravityAxis = 2;
 
-    if (absY > largest)
-    {
-        largest = absY;
-        gravityAxis = 1;
-    }
-
-    if (absZ > largest)
-    {
-        largest = absZ;
-        gravityAxis = 2;
-    }
-
-    bool approximatelyFlat =
-        largest > GRAVITY * 0.80f &&
+    bool alignedWithGravity =
+        fabsf(averageAccel[gravityAxis]) > GRAVITY * 0.80f &&
         fabsf(magnitude - GRAVITY) < 2.0f;
 
-    if (approximatelyFlat && stableGyro)
-    {
-        float expectedX = 0.0f;
-        float expectedY = 0.0f;
-        float expectedZ = 0.0f;
-
-        if (gravityAxis == 0)
-        {
-            expectedX = avgAx >= 0 ? GRAVITY : -GRAVITY;
+    if (stableGyro && alignedWithGravity) {
+        const float expectedGravityCounts =
+            averageAccel[gravityAxis] >= 0.0f ? 2048.0f : -2048.0f;
+        for (uint8_t axis = 0; axis < 3; axis++) {
+            float expectedCounts = axis == gravityAxis
+                ? expectedGravityCounts : 0.0f;
+            accelBiasRaw[axis] =
+                accelSum[axis] / IMU_CAL_SAMPLES - expectedCounts;
         }
-        else if (gravityAxis == 1)
-        {
-            expectedY = avgAy >= 0 ? GRAVITY : -GRAVITY;
-        }
-        else
-        {
-            expectedZ = avgAz >= 0 ? GRAVITY : -GRAVITY;
-        }
-
-        accelBiasX = avgAx - expectedX;
-        accelBiasY = avgAy - expectedY;
-        accelBiasZ = avgAz - expectedZ;
-
-        accelCalibrated = true;
-
-        Serial.println("# Accelerometer single-position offset applied");
+        Serial.println("Accelerometer single-position offset calibrated.");
+    } else {
+        Serial.println("Accelerometer offset skipped; keep one axis aligned with gravity.");
     }
-    else
-    {
-        Serial.println("# WARNING: Accelerometer offset skipped");
-        Serial.println("# Keep one sensor axis aligned with gravity");
-    }
-
-    Serial.printf(
-        "# Gyro bias: %.3f, %.3f, %.3f deg/s\n",
-        gyroBiasX, gyroBiasY, gyroBiasZ
-    );
-
-    Serial.printf(
-        "# Accel bias: %.3f, %.3f, %.3f m/s^2\n",
-        accelBiasX, accelBiasY, accelBiasZ
-    );
-
-    Serial.println("# IMU calibration finished");
 
     return gyroCalibrated;
 }
 
-// =====================================================
-// ZERO ALTITUDE CALIBRATION
-// =====================================================
+bool calibrateAltitudeZero() {
+    if (!bmpInitialized) return false;
 
-bool calibrateAltitudeZero()
-{
-    Serial.println();
-    Serial.println("# Starting altitude zero calibration");
-    Serial.println("# Keep the BMP280 at reference height");
-
-    altitudeCalibrated = false;
-
+    Serial.println("\nKeep the BMP280 at the reference height...");
     double pressureSum = 0.0;
-
-    for (uint16_t i = 0; i < BMP_CAL_SAMPLES; i++)
-    {
+    for (uint16_t sample = 0; sample < BMP_CAL_SAMPLES; sample++) {
         float pressure = bmp.readPressure();
-
-        if (!isfinite(pressure) ||
-            pressure < 30000.0f ||
-            pressure > 120000.0f)
-        {
-            Serial.println("# ERROR: Invalid calibration pressure");
+        if (!isfinite(pressure) || pressure < 30000.0f || pressure > 120000.0f) {
+            Serial.println("Invalid pressure during altitude calibration.");
             return false;
         }
-
         pressureSum += pressure;
-
         delay(BMP_CAL_DELAY_MS);
     }
 
     pressureZeroPa = pressureSum / BMP_CAL_SAMPLES;
-
     altitudeCalibrated = true;
-
-    Serial.printf("# Zero reference pressure: %.2f Pa\n", pressureZeroPa);
-    Serial.println("# Current altitude reference = 0.00 m");
-
-    kalmanAltitude = 0.0f;
-    kalmanP = 1.0f;
-    kalmanInitialized = true;
-    lastKalmanTime = millis();
-
-    Serial.println("# Altitude calibration complete");
-
+    altitudeFilterInitialized = true;
+    filteredAltitude = 0.0f;
+    altitudeCovariance = 1.0f;
+    lastAltitudeFilterTime = millis();
+    Serial.printf("Altitude reference pressure: %.1f Pa\n", pressureZeroPa);
     return true;
 }
 
-// =====================================================
-// RELATIVE ALTITUDE
-// =====================================================
+void updateFlightState(uint32_t now) {
+    if (flightState == STATE_STARTUP) return;
 
-float calculateRelativeAltitude(float pressurePa)
-{
-    if (!altitudeCalibrated ||
-        pressureZeroPa <= 0.0f ||
-        pressurePa <= 0.0f)
-    {
-        return NAN;
-    }
-
-    float ratio = pressurePa / pressureZeroPa;
-
-    return 44330.0f *
-        (1.0f - powf(ratio, 0.19029495f));
-}
-
-// =====================================================
-// 1D KALMAN FILTER
-// =====================================================
-
-float updateAltitudeKalman(float measurement)
-{
-    uint32_t now = millis();
-
-    if (!kalmanInitialized)
-    {
-        kalmanAltitude = measurement;
-        kalmanP = 1.0f;
-
-        kalmanInitialized = true;
-        lastKalmanTime = now;
-
-        return kalmanAltitude;
-    }
-
-    float dt = (uint32_t)(now - lastKalmanTime) / 1000.0f;
-
-    lastKalmanTime = now;
-
-    if (dt <= 0.0f)
-    {
-        dt = 0.001f;
-    }
-
-    kalmanP += KALMAN_Q * dt;
-
-    float K = kalmanP / (kalmanP + KALMAN_R);
-
-    kalmanAltitude += K * (measurement - kalmanAltitude);
-
-    kalmanP *= (1.0f - K);
-
-    return kalmanAltitude;
-}
-
-// =====================================================
-// READ ALL SENSORS
-// =====================================================
-
-bool readSensors()
-{
-    RawIMU raw;
-
-    if (!readIMURaw(raw))
-    {
-        return false;
-    }
-
-    sensor.timestamp = millis();
-
-    // Accelerometer (+/-16g)
-    float ax = (raw.ax / 2048.0f) * GRAVITY;
-    float ay = (raw.ay / 2048.0f) * GRAVITY;
-    float az = (raw.az / 2048.0f) * GRAVITY;
-
-    sensor.ax = ax - accelBiasX;
-    sensor.ay = ay - accelBiasY;
-    sensor.az = az - accelBiasZ;
-
-    // Gyroscope (+/-2000 deg/s)
-    float gx = raw.gx / 16.4f;
-    float gy = raw.gy / 16.4f;
-    float gz = raw.gz / 16.4f;
-
-    sensor.gx = gx - gyroBiasX;
-    sensor.gy = gy - gyroBiasY;
-    sensor.gz = gz - gyroBiasZ;
-
-    // IMU temperature
-    if (imuChipID == 0x70)
-    {
-        sensor.mpuTemp = raw.temperature / 333.87f + 21.0f;
-    }
-    else if (imuChipID == 0x68)
-    {
-        sensor.mpuTemp = raw.temperature / 340.0f + 36.53f;
-    }
-    else
-    {
-        sensor.mpuTemp = NAN;
-    }
-
-    // BMP280
-    sensor.bmpTemp = bmp.readTemperature();
-    sensor.pressure = bmp.readPressure();
-
-    if (!isfinite(sensor.bmpTemp) ||
-        !isfinite(sensor.pressure) ||
-        sensor.pressure <= 0.0f)
-    {
-        return false;
-    }
-
-    float rawAltitude = calculateRelativeAltitude(sensor.pressure);
-
-    if (!isfinite(rawAltitude))
-    {
-        return false;
-    }
-
-    sensor.rawAltitude = rawAltitude;
-
-    sensor.filteredAltitude = updateAltitudeKalman(rawAltitude);
-
-    return isfinite(sensor.filteredAltitude);
-}
-
-// =====================================================
-// FLIGHT STATE MACHINE
-// =====================================================
-
-// Dipanggil sekali setiap siklus sensor (10 Hz)
-// setelah data sensor valid.
-
-void updateFlightState()
-{
-    // STARTUP -> ARMING ditangani di sendTelemetry()
-    // (setelah paket telemetry pertama berhasil dikirim).
-    if (flightState == STATE_STARTUP)
-    {
+    if (!stateReferenceValid) {
+        previousStateAltitude = filteredAltitude;
+        previousStateTime = now;
+        maximumAltitude = filteredAltitude;
+        stateReferenceValid = true;
         return;
     }
 
-    float altitude = sensor.filteredAltitude;
-    uint32_t t = sensor.timestamp;
+    float dt = (uint32_t)(now - previousStateTime) / 1000.0f;
+    if (dt <= 0.0f) return;
 
-    if (!stateRefValid)
-    {
-        prevStateAltitude = altitude;
-        prevStateTime = t;
-        maxAltitude = altitude;
-        stateRefValid = true;
-        return;
-    }
-
-    float dt = (uint32_t)(t - prevStateTime) / 1000.0f;
-
-    if (dt <= 0.0f)
-    {
-        return;
-    }
-
-    float delta = altitude - prevStateAltitude;
+    float delta = filteredAltitude - previousStateAltitude;
     float velocity = delta / dt;
+    previousStateAltitude = filteredAltitude;
+    previousStateTime = now;
+    if (filteredAltitude > maximumAltitude) maximumAltitude = filteredAltitude;
 
-    prevStateAltitude = altitude;
-    prevStateTime = t;
-
-    if (altitude > maxAltitude)
-    {
-        maxAltitude = altitude;
-    }
-
-    switch (flightState)
-    {
-        // -------------------------------------------------
+    switch (flightState) {
         case STATE_ARMING:
-        // -------------------------------------------------
-            // Naik pesat dan stabil
             if (velocity >= BOOST_VELOCITY_MPS &&
-                altitude >= BOOST_MIN_ALTITUDE_M)
-            {
-                if (boostCount < 255) boostCount++;
-            }
-            else
-            {
+                filteredAltitude >= BOOST_MIN_ALTITUDE_M) {
+                if (boostCount < UINT8_MAX) boostCount++;
+            } else {
                 boostCount = 0;
             }
-
-            if (boostCount >= BOOST_CONFIRM_SAMPLES)
-            {
+            if (boostCount >= BOOST_CONFIRM_SAMPLES) {
                 flightState = STATE_BOOST;
                 descentCount = 0;
-                maxAltitude = altitude;
-
-                Serial.println("# STATE -> 2 BOOST");
+                maximumAltitude = filteredAltitude;
+                Serial.println("FLIGHT STATE: BOOST");
             }
             break;
 
-        // -------------------------------------------------
         case STATE_BOOST:
-        // -------------------------------------------------
-            // 25 penurunan berturut-turut
-            if (delta < -ALTITUDE_DEADBAND_M)
-            {
-                if (descentCount < 255) descentCount++;
-            }
-            else if (delta > ALTITUDE_DEADBAND_M)
-            {
+            if (delta < -ALTITUDE_DEADBAND_M) {
+                if (descentCount < UINT8_MAX) descentCount++;
+            } else if (delta > ALTITUDE_DEADBAND_M) {
                 descentCount = 0;
             }
-            // di dalam deadband: hitungan dipertahankan
-
-            if (descentCount >= APOGEE_DESCENT_SAMPLES)
-            {
+            if (descentCount >= APOGEE_DESCENT_SAMPLES) {
                 flightState = STATE_APOGEE;
                 stableCount = 0;
-
-                // Sinyal apogee: GPIO26 (test LED) HIGH selama 3 detik
                 digitalWrite(MOSFET_SIGNAL, HIGH);
-                apogeeLedActive = true;
-                apogeeLedStartTime = millis();
-
-                Serial.println("# STATE -> 3 APOGEE");
-                Serial.println("# GPIO26 MOSFET_SIGNAL = HIGH (3 s)");
+                apogeeSignalActive = true;
+                apogeeSignalStartTime = now;
+                Serial.println("FLIGHT STATE: APOGEE; GPIO26 HIGH");
             }
             break;
 
         case STATE_APOGEE:
-            // Data ketinggian relatif stabil, dan sudah
-            // turun cukup jauh dari puncak.
             if (fabsf(delta) < LANDING_STABLE_BAND_M &&
-                (maxAltitude - altitude) >= LANDING_MIN_DROP_M)
-            {
-                if (stableCount < 65535) stableCount++;
-            }
-            else
-            {
+                maximumAltitude - filteredAltitude >= LANDING_MIN_DROP_M) {
+                if (stableCount < UINT16_MAX) stableCount++;
+            } else {
                 stableCount = 0;
             }
-
-            if (stableCount >= LANDING_STABLE_SAMPLES)
-            {
+            if (stableCount >= LANDING_STABLE_SAMPLES) {
                 flightState = STATE_LANDING;
-
-                Serial.println("# STATE -> 4 LANDING");
+                Serial.println("FLIGHT STATE: LANDING");
             }
             break;
 
@@ -923,250 +597,271 @@ void updateFlightState()
     }
 }
 
-// =====================================================
-// CREATE CSV TELEMETRY (11 kolom)
-// =====================================================
+void updateSensorData() {
+    int16_t ax, ay, az, gx, gy, gz, mpuTemperatureRaw;
+    filteredMPUValid = readMPU(ax, ay, az, gx, gy, gz,
+                               mpuTemperatureRaw);
 
-bool createCSV(char *buffer, size_t bufferSize)
-{
-    char imuTempText[24];
+    if (filteredMPUValid) {
+        const float accelReadings[3] = {
+            ax - accelBiasRaw[0], ay - accelBiasRaw[1],
+            az - accelBiasRaw[2]
+        };
+        const float gyroReadings[3] = {
+            gx - gyroBiasRaw[0], gy - gyroBiasRaw[1],
+            gz - gyroBiasRaw[2]
+        };
 
-    if (isfinite(sensor.mpuTemp))
-    {
-        snprintf(imuTempText, sizeof(imuTempText), "%.2f", sensor.mpuTemp);
-    }
-    else
-    {
-        snprintf(imuTempText, sizeof(imuTempText), "NA");
-    }
+        for (uint8_t axis = 0; axis < 3; axis++) {
+            filteredAccel[axis] = (int16_t)lroundf(
+                updateKalman(accelFilters[axis], accelReadings[axis],
+                             0.1f, 8.0f));
+            filteredGyro[axis] = (int16_t)lroundf(
+                updateKalman(gyroFilters[axis], gyroReadings[axis],
+                             0.1f, 8.0f));
+        }
 
-    int length = snprintf(
-        buffer,
-        bufferSize,
-
-        "%lu;"
-        "%.2f;%.2f;%.2f;"
-        "%.2f;%.2f;%.2f;"
-        "%s;%.2f;"
-        "%.0f;%.2f",
-
-        (unsigned long)sensor.timestamp,
-
-        sensor.ax,
-        sensor.ay,
-        sensor.az,
-
-        sensor.gx,
-        sensor.gy,
-        sensor.gz,
-
-        imuTempText,
-        sensor.bmpTemp,
-
-        sensor.pressure,
-        sensor.filteredAltitude
-    );
-
-    return length > 0 &&
-           (size_t)length < bufferSize &&
-           length <= 250;
-}
-
-// =====================================================
-// SEND LORA TELEMETRY
-// =====================================================
-
-// Format paket:
-//   <state>\n
-//   <csv 11 kolom>
-
-void sendTelemetry()
-{
-    if (!sensorDataValid)
-    {
-        return;
+        float mpuTemperature = mpuChipId == 0x70
+            ? mpuTemperatureRaw / 333.87f + 21.0f
+            : mpuTemperatureRaw / 340.0f + 36.53f;
+        filteredMpuTemperature = updateKalman(
+            mpuTemperatureFilter, mpuTemperature, 0.01f, 0.5f);
     }
 
-    char csvPacket[180];
+    filteredBMPValid = false;
+    if (bmpInitialized) {
+        float temperature = bmp.readTemperature();
+        float pressure = bmp.readPressure();
 
-    if (!createCSV(csvPacket, sizeof(csvPacket)))
-    {
-        Serial.println("# ERROR: CSV formatting failed");
-        return;
-    }
+        if (isfinite(temperature) && isfinite(pressure) && pressure > 0.0f) {
+            float smoothTemperature = updateKalman(
+                temperatureFilter, temperature, 0.01f, 0.5f);
+            float smoothPressure = updateKalman(
+                pressureFilter, pressure, 0.25f, 25.0f);
 
-    if (LoRa.beginPacket() == 0)
-    {
-        Serial.println("# LoRa busy, packet skipped");
-        return;
-    }
-
-    // Satu baris: state;data sensor (pemisah ";")
-    LoRa.print((int)flightState);
-    LoRa.print(';');
-    LoRa.print(csvPacket);
-
-    int result = LoRa.endPacket(true);
-
-    if (result == 1)
-    {
-        // Paket masuk antrean TX (bukan ACK dari receiver).
-        Serial.print((int)flightState);
-        Serial.print(';');
-        Serial.println(csvPacket);
-
-        // Telemetry sudah berjalan -> ARMING
-        if (flightState == STATE_STARTUP)
-        {
-            flightState = STATE_ARMING;
-            Serial.println("# STATE -> 1 ARMING");
+            if (smoothTemperature * 100.0f >= -32768.0f &&
+                smoothTemperature * 100.0f <= 32767.0f &&
+                smoothPressure > 0.0f &&
+                smoothPressure <= 4294967295.0f) {
+                filteredTemperature = (int16_t)lroundf(
+                    smoothTemperature * 100.0f);
+                filteredPressure = (uint32_t)lroundf(smoothPressure);
+                filteredBMPValid = true;
+            }
         }
     }
-    else
-    {
-        Serial.println("# ERROR: LoRa transmission start failed");
+
+    if (filteredBMPValid && altitudeCalibrated) {
+        float pressureRatio = filteredPressure / pressureZeroPa;
+        float rawAltitude = 44330.0f *
+            (1.0f - powf(pressureRatio, 0.19029495f));
+        uint32_t now = millis();
+
+        if (!altitudeFilterInitialized) {
+            filteredAltitude = rawAltitude;
+            altitudeCovariance = 1.0f;
+            altitudeFilterInitialized = true;
+        } else {
+            float dt = (uint32_t)(now - lastAltitudeFilterTime) / 1000.0f;
+            if (dt <= 0.0f) dt = 0.001f;
+            altitudeCovariance += ALTITUDE_KALMAN_Q * dt;
+            float gain = altitudeCovariance /
+                         (altitudeCovariance + ALTITUDE_KALMAN_R);
+            filteredAltitude += gain * (rawAltitude - filteredAltitude);
+            altitudeCovariance *= 1.0f - gain;
+        }
+
+        lastAltitudeFilterTime = now;
+        updateFlightState(now);
     }
 }
 
-// =====================================================
-// APOGEE LED TIMER
-// =====================================================
+// ---------- TELEMETRY ----------
+bool sendTelemetry() {
+    TelemetryPacket packet = {};
 
-// Mematikan GPIO26 setelah APOGEE_MOSFET_DURATION_MS.
+    packet.magic = MAGIC;
+    packet.version = TELEMETRY_VERSION;
+    packet.sequence = sequenceNumber++;
+    packet.uptime_ms = millis();
+    packet.flight_state = (uint8_t)flightState;
 
-void updateApogeeLed()
-{
-    if (apogeeLedActive &&
-        (uint32_t)(millis() - apogeeLedStartTime) >=
-            APOGEE_MOSFET_DURATION_MS)
-    {
-        digitalWrite(MOSFET_SIGNAL, LOW);
-        apogeeLedActive = false;
-
-        Serial.println("# GPIO26 MOSFET_SIGNAL = LOW");
+    if (filteredMPUValid) {
+        packet.ax = filteredAccel[0];
+        packet.ay = filteredAccel[1];
+        packet.az = filteredAccel[2];
+        packet.gx = filteredGyro[0];
+        packet.gy = filteredGyro[1];
+        packet.gz = filteredGyro[2];
+        packet.flags |= FLAG_MPU_VALID;
+        if (isfinite(filteredMpuTemperature) &&
+            filteredMpuTemperature * 100.0f >= -32768.0f &&
+            filteredMpuTemperature * 100.0f <= 32767.0f) {
+            packet.mpu_temperature_centi_c = (int16_t)lroundf(
+                filteredMpuTemperature * 100.0f);
+        }
     }
-}
 
-void printCSVHeader()
-{
-    Serial.println(
-        "State;"
-        "Timestamp_ms;"
-        "Accel_X;Accel_Y;Accel_Z;"
-        "Gyro_X;Gyro_Y;Gyro_Z;"
-        "MPU_Temp_C;"
-        "BMP_Temp_C;"
-        "Pressure_Pa;"
-        "Altitude_m"
+    if (filteredBMPValid) {
+        packet.temperature_centi_c = filteredTemperature;
+        packet.pressure_pa = filteredPressure;
+        packet.flags |= FLAG_BMP_VALID;
+    }
+
+    if (altitudeCalibrated && filteredBMPValid &&
+        isfinite(filteredAltitude) &&
+        filteredAltitude * 100.0f >= -2147483648.0f &&
+        filteredAltitude * 100.0f <= 2147483647.0f) {
+        packet.relative_altitude_cm = (int32_t)lroundf(
+            filteredAltitude * 100.0f);
+        packet.flags |= FLAG_ALTITUDE_VALID;
+    }
+
+    if (gpsInitialized && gps.location.isValid() &&
+        gps.location.age() <= GPS_MAX_AGE_MS) {
+        double latitude = gps.location.lat();
+        double longitude = gps.location.lng();
+
+        if (isfinite(latitude) && isfinite(longitude)) {
+            packet.latitude_e7 = (int32_t)lround(latitude * 10000000.0);
+            packet.longitude_e7 = (int32_t)lround(longitude * 10000000.0);
+            packet.gps_altitude_cm =
+                gps.altitude.isValid() && isfinite(gps.altitude.meters())
+                    ? (int32_t)lround(gps.altitude.meters() * 100.0)
+                    : 0;
+            packet.gps_satellites = gps.satellites.isValid()
+                ? (uint8_t)gps.satellites.value()
+                : 0;
+            packet.flags |= FLAG_GPS_VALID;
+        }
+    }
+
+    esp_err_t result = esp_now_send(
+        receiverMAC,
+        (const uint8_t *)&packet,
+        sizeof(packet)
     );
+
+    if (result != ESP_OK) {
+        Serial.printf("Telemetry send failed: %s\n",
+                      esp_err_to_name(result));
+        return false;
+    }
+
+    if (flightState == STATE_STARTUP) {
+        flightState = STATE_ARMING;
+        Serial.println("FLIGHT STATE: ARMING");
+    }
+    return true;
 }
 
-// =====================================================
-// SETUP
-// =====================================================
-
-void setup()
-{
+// ---------- SETUP ----------
+void setup() {
     Serial.begin(115200);
-    delay(1000);
+    delay(500);
 
-    // GPIO26 dipastikan LOW sebelum jadi output
     digitalWrite(MOSFET_SIGNAL, LOW);
     pinMode(MOSFET_SIGNAL, OUTPUT);
-
     flightState = STATE_STARTUP;
 
-    Serial.println();
-    Serial.println("==================================");
-    Serial.println(" AVIONICS LORA SENSOR TRANSMITTER");
-    Serial.println("==================================");
-    Serial.println("# STATE 0 STARTUP");
+    Serial.println("\n=== ESP-NOW ROCKET AVIONICS ===");
+    Serial.println("Flight state: STARTUP");
 
     Wire.begin(SDA_PIN, SCL_PIN);
     Wire.setClock(100000);
-    Wire.setTimeOut(100);
 
-    if (!initializeIMU())
-    {
-        Serial.println("# FATAL: IMU initialization failed");
-        while (true) { delay(1000); }
+    initializeMPU();
+    initializeBMP();
+    initializeGPS();
+
+    if (!calibrateMPU()) {
+        Serial.println("MPU calibration incomplete; using uncorrected gyro readings.");
+    }
+    if (!calibrateAltitudeZero()) {
+        Serial.println("Altitude calibration failed; flight-state detection unavailable.");
     }
 
-    if (!initializeBMP())
-    {
-        Serial.println("# FATAL: BMP280 initialization failed");
-        while (true) { delay(1000); }
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+
+    Serial.print("Transmitter MAC: ");
+    Serial.println(WiFi.macAddress());
+
+    esp_err_t channelResult =
+        esp_wifi_set_channel(
+            ESPNOW_CHANNEL,
+            WIFI_SECOND_CHAN_NONE
+        );
+
+    if (channelResult != ESP_OK) {
+        Serial.printf("Channel setup failed: %s\n",
+                      esp_err_to_name(channelResult));
     }
 
-    if (!initializeLoRa())
-    {
-        Serial.println("# FATAL: LoRa initialization failed");
-        while (true) { delay(1000); }
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW initialization failed!");
+        while (true) {
+            delay(1000);
+        }
     }
 
-    Serial.println();
-    Serial.println("# CALIBRATION STARTING");
-    Serial.println("# Do not move the sensor board");
-
-    if (!calibrateIMU())
-    {
-        Serial.println("# WARNING: Gyroscope not calibrated");
-        Serial.println("# IMU readings may contain bias");
+    if (!addPeer(broadcastMAC)) {
+        Serial.println("Could not add broadcast peer.");
+        while (true) {
+            delay(1000);
+        }
     }
 
-    if (!calibrateAltitudeZero())
-    {
-        Serial.println("# FATAL: Altitude zero calibration failed");
-        while (true) { delay(1000); }
-    }
+    esp_now_register_recv_cb(onReceive);
 
-    Serial.println();
-    Serial.println("# SYSTEM READY");
-    Serial.println("# Sensor polling: 10 Hz");
-    Serial.println("# LoRa telemetry target: 5 Hz");
-    Serial.println("# Packet: state;data sensor (satu baris, pemisah ;)");
-    Serial.println("# States: 0 STARTUP, 1 ARMING, 2 BOOST, 3 APOGEE, 4 LANDING");
-    Serial.println("# GPIO26 HIGH for 3 s at APOGEE");
-    Serial.println();
-
-    printCSVHeader();
-
-    lastSensorTime = millis();
-    lastTelemetryTime = millis();
+    Serial.println("Waiting for receiver discovery...");
 }
 
-// =====================================================
-// MAIN LOOP
-// =====================================================
+// ---------- LOOP ----------
+void loop() {
+    processDiscoveryResponse();
+    updateGPS();
 
-void loop()
-{
-    uint32_t now = millis();
+    unsigned long now = millis();
 
-    updateApogeeLed();
-
-    // Sensor update - 10 Hz
-    if ((uint32_t)(now - lastSensorTime) >= SENSOR_INTERVAL_MS)
-    {
-        lastSensorTime = now;
-
-        sensorDataValid = readSensors();
-
-        if (sensorDataValid)
-        {
-            updateFlightState();
-        }
-        else
-        {
-            Serial.println("# ERROR: Sensor read failed");
-        }
+    if (now - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL_MS) {
+        lastSensorUpdate = now;
+        updateSensorData();
     }
 
-    // LoRa telemetry - target 5 Hz
-    if ((uint32_t)(now - lastTelemetryTime) >= TELEMETRY_INTERVAL_MS)
-    {
-        lastTelemetryTime = now;
+    if (apogeeSignalActive &&
+        (uint32_t)(now - apogeeSignalStartTime) >=
+            APOGEE_SIGNAL_DURATION_MS) {
+        digitalWrite(MOSFET_SIGNAL, LOW);
+        apogeeSignalActive = false;
+        Serial.println("GPIO26 apogee signal LOW");
+    }
 
+    if (!receiverConnected) {
+        if (now - lastDiscovery >= DISCOVERY_INTERVAL_MS) {
+            lastDiscovery = now;
+
+            ControlMessage discovery = {
+                MAGIC,
+                MSG_DISCOVERY,
+                VERSION
+            };
+
+            esp_now_send(
+                broadcastMAC,
+                (const uint8_t *)&discovery,
+                sizeof(discovery)
+            );
+
+            Serial.println("Searching for receiver...");
+        }
+
+        delay(5);
+        return;
+    }
+
+    if (now - lastSend >= SEND_INTERVAL_MS) {
+        lastSend = now;
         sendTelemetry();
     }
 }
