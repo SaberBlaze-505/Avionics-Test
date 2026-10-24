@@ -10,6 +10,7 @@
 // ---------- HARDWARE ----------
 #define SDA_PIN 21
 #define SCL_PIN 22
+#define MOSFET_SIGNAL 26
 
 // NEO-6M UART2: GPS TX -> ESP32 RX, GPS RX -> ESP32 TX.
 #define GPS_ENABLED 1
@@ -20,85 +21,53 @@
 
 // ---------- ESP-NOW ----------
 #define ESPNOW_CHANNEL 1
-#define SENSOR_UPDATE_INTERVAL_MS 100
-#define SEND_INTERVAL_MS 1000
+#define SEND_INTERVAL_MS 1000        // telemetry rate: 1 Hz
 #define DISCOVERY_INTERVAL_MS 1000
-#define TELEMETRY_VERSION 2
+#define TELEMETRY_VERSION 3          // text (semicolon) format
 
-#define MOSFET_SIGNAL 26
-
+// ---------- CALIBRATION ----------
 const uint16_t IMU_CAL_SAMPLES = 250;
 const uint16_t IMU_CAL_DELAY_MS = 10;
 const uint16_t BMP_CAL_SAMPLES = 40;
 const uint16_t BMP_CAL_DELAY_MS = 120;
 
+// ---------- FLIGHT LOGIC ----------
 const float GRAVITY = 9.80665f;
 const float ALTITUDE_KALMAN_Q = 0.6f;
 const float ALTITUDE_KALMAN_R = 1.5f;
+
+const uint32_t STATE_WINDOW_MS = 100;       // window for velocity / landing checks
 const float BOOST_VELOCITY_MPS = 3.0f;
-const uint8_t BOOST_CONFIRM_SAMPLES = 5;
+const uint8_t BOOST_CONFIRM_WINDOWS = 5;
 const float BOOST_MIN_ALTITUDE_M = 1.0f;
-const uint8_t APOGEE_DESCENT_SAMPLES = 25;
+
+const uint8_t APOGEE_DESCENT_SAMPLES = 20;  // 20 consecutive decreasing BMP samples
 const float ALTITUDE_DEADBAND_M = 0.02f;
-const uint32_t APOGEE_SIGNAL_DURATION_MS = 3000;
+const uint32_t APOGEE_SIGNAL_DURATION_MS = 5000; // MOSFET HIGH for 5 s
+
 const float LANDING_STABLE_BAND_M = 0.30f;
-const uint16_t LANDING_STABLE_SAMPLES = 30;
+const uint16_t LANDING_STABLE_WINDOWS = 30;
 const float LANDING_MIN_DROP_M = 2.0f;
 
-
-
+// ---------- CONTROL PROTOCOL ----------
 #define MAGIC 0x4D425954UL
 #define VERSION 1
 
 #define MSG_DISCOVERY 1
 #define MSG_RESPONSE  2
-#define MSG_TELEMETRY 3
 
 #define FLAG_MPU_VALID 0x01
 #define FLAG_BMP_VALID 0x02
 #define FLAG_GPS_VALID 0x04
 #define FLAG_ALTITUDE_VALID 0x08
 
-// ---------- PACKETS ----------
 struct __attribute__((packed)) ControlMessage {
     uint32_t magic;
     uint8_t type;
     uint8_t version;
 };
 
-struct __attribute__((packed)) TelemetryPacket {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t sequence;
-    uint32_t uptime_ms;
-
-    int16_t ax;
-    int16_t ay;
-    int16_t az;
-
-    int16_t gx;
-    int16_t gy;
-    int16_t gz;
-
-    int16_t temperature_centi_c;
-    uint32_t pressure_pa;
-
-    int32_t latitude_e7;
-    int32_t longitude_e7;
-    int32_t gps_altitude_cm;
-    uint8_t gps_satellites;
-
-    uint8_t flags;
-    uint8_t flight_state;
-    int32_t relative_altitude_cm;
-    int16_t mpu_temperature_centi_c;
-};
-
-static_assert(sizeof(ControlMessage) == 6,
-              "ControlMessage size mismatch");
-
-static_assert(sizeof(TelemetryPacket) == 51,
-              "TelemetryPacket size mismatch");
+static_assert(sizeof(ControlMessage) == 6, "ControlMessage size mismatch");
 
 enum FlightState : uint8_t {
     STATE_STARTUP = 0,
@@ -108,7 +77,7 @@ enum FlightState : uint8_t {
     STATE_LANDING = 4
 };
 
-// ---------- I2C SENSORS ----------
+// ---------- SENSORS ----------
 Adafruit_BMP280 bmp;
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2);
@@ -122,10 +91,7 @@ bool gpsInitialized = false;
 uint8_t mpuChipId = 0;
 
 // ---------- ESP-NOW STATE ----------
-uint8_t broadcastMAC[] = {
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
-};
-
+uint8_t broadcastMAC[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 uint8_t receiverMAC[6] = {0};
 bool receiverConnected = false;
 
@@ -133,11 +99,10 @@ volatile bool responsePending = false;
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
 uint16_t sequenceNumber = 0;
-
 unsigned long lastDiscovery = 0;
-unsigned long lastSensorUpdate = 0;
 unsigned long lastSend = 0;
 
+// ---------- FILTERS ----------
 struct KalmanFilter {
     float estimate = 0.0f;
     float covariance = 1.0f;
@@ -164,23 +129,24 @@ float pressureZeroPa = 0.0f;
 bool gyroCalibrated = false;
 bool altitudeCalibrated = false;
 
+float filteredAltitude = 0.0f;
+float altitudeCovariance = 1.0f;
+bool altitudeFilterInitialized = false;
+uint32_t lastAltitudeFilterTime = 0;
+float lastRawPressure = NAN;   // used to detect NEW barometer data
+
+// ---------- FLIGHT STATE ----------
 FlightState flightState = STATE_STARTUP;
 bool stateReferenceValid = false;
-float previousStateAltitude = 0.0f;
-uint32_t previousStateTime = 0;
+float previousSampleAltitude = 0.0f;
+float windowAltitude = 0.0f;
+uint32_t windowTime = 0;
 float maximumAltitude = 0.0f;
 uint8_t boostCount = 0;
 uint8_t descentCount = 0;
 uint16_t stableCount = 0;
 bool apogeeSignalActive = false;
 uint32_t apogeeSignalStartTime = 0;
-
-float filteredAltitude = 0.0f;
-float altitudeCovariance = 1.0f;
-bool altitudeFilterInitialized = false;
-uint32_t lastAltitudeFilterTime = 0;
-
-void updateFlightState(uint32_t now);
 
 // ---------- I2C HELPERS ----------
 bool devicePresent(uint8_t address) {
@@ -198,15 +164,8 @@ bool writeMPURegister(uint8_t reg, uint8_t value) {
 bool readMPURegister(uint8_t reg, uint8_t &value) {
     Wire.beginTransmission(mpuAddress);
     Wire.write(reg);
-
-    if (Wire.endTransmission(false) != 0) {
-        return false;
-    }
-
-    if (Wire.requestFrom(mpuAddress, (uint8_t)1) != 1) {
-        return false;
-    }
-
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(mpuAddress, (uint8_t)1) != 1) return false;
     value = Wire.read();
     return true;
 }
@@ -233,14 +192,13 @@ void initializeMPU() {
         Serial.printf("WHO_AM_I: 0x%02X\n", mpuChipId);
     }
 
-    // Wake the sensor. Do not reject compatible clones solely
-    // because their WHO_AM_I value differs from 0x68.
     if (!writeMPURegister(0x6B, 0x00)) {
         Serial.println("Failed to wake MPU.");
         mpuInitialized = false;
         return;
     }
 
+    // Accel +-16g, gyro +-2000 dps, DLPF ~21 Hz
     if (!writeMPURegister(0x1C, 0x18) ||
         !writeMPURegister(0x1B, 0x18) ||
         !writeMPURegister(0x1A, 0x04)) {
@@ -250,7 +208,6 @@ void initializeMPU() {
     }
 
     delay(100);
-
     mpuInitialized = true;
     Serial.println("MPU initialized.");
 }
@@ -258,17 +215,17 @@ void initializeMPU() {
 void initializeBMP() {
     Serial.println("\nSearching for BMP280...");
 
-if (bmp.begin(0x76)) {
-    bmpInitialized = true;
-    Serial.println("BMP280 found at 0x76.");
-} else if (bmp.begin(0x77)) {
-    bmpInitialized = true;
-    Serial.println("BMP280 found at 0x77.");
-} else {
-    bmpInitialized = false;
-    Serial.println("BMP280 not found.");
-    return;
-}
+    if (bmp.begin(0x76)) {
+        bmpInitialized = true;
+        Serial.println("BMP280 found at 0x76.");
+    } else if (bmp.begin(0x77)) {
+        bmpInitialized = true;
+        Serial.println("BMP280 found at 0x77.");
+    } else {
+        bmpInitialized = false;
+        Serial.println("BMP280 not found.");
+        return;
+    }
 
     bmp.setSampling(
         Adafruit_BMP280::MODE_NORMAL,
@@ -301,9 +258,7 @@ void updateGPS() {
 
 // ---------- ESP-NOW HELPERS ----------
 bool addPeer(const uint8_t *mac) {
-    if (esp_now_is_peer_exist(mac)) {
-        return true;
-    }
+    if (esp_now_is_peer_exist(mac)) return true;
 
     esp_now_peer_info_t peer = {};
     memcpy(peer.peer_addr, mac, 6);
@@ -312,29 +267,20 @@ bool addPeer(const uint8_t *mac) {
     peer.ifidx = WIFI_IF_STA;
 
     esp_err_t result = esp_now_add_peer(&peer);
-
     if (result != ESP_OK) {
-        Serial.printf("Failed to add peer: %s\n",
-                      esp_err_to_name(result));
+        Serial.printf("Failed to add peer: %s\n", esp_err_to_name(result));
         return false;
     }
-
     return true;
 }
 
-// Older Arduino-ESP32 core 2.x callback signature.
-void onReceive(const uint8_t *mac,
-               const uint8_t *data,
-               int len) {
-    if (len != sizeof(ControlMessage)) {
-        return;
-    }
+static void handleControl(const uint8_t *mac, const uint8_t *data, int len) {
+    if (len != sizeof(ControlMessage)) return;
 
     ControlMessage msg;
     memcpy(&msg, data, sizeof(msg));
 
-    if (msg.magic != MAGIC ||
-        msg.version != VERSION ||
+    if (msg.magic != MAGIC || msg.version != VERSION ||
         msg.type != MSG_RESPONSE) {
         return;
     }
@@ -345,23 +291,29 @@ void onReceive(const uint8_t *mac,
     portEXIT_CRITICAL(&mux);
 }
 
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+    handleControl(info->src_addr, data, len);
+}
+#else
+void onReceive(const uint8_t *mac, const uint8_t *data, int len) {
+    handleControl(mac, data, len);
+}
+#endif
+
 void processDiscoveryResponse() {
     uint8_t discoveredMAC[6];
     bool pending = false;
 
     portENTER_CRITICAL(&mux);
-
     if (responsePending) {
         memcpy(discoveredMAC, receiverMAC, 6);
         responsePending = false;
         pending = true;
     }
-
     portEXIT_CRITICAL(&mux);
 
-    if (!pending) {
-        return;
-    }
+    if (!pending) return;
 
     if (!addPeer(discoveredMAC)) {
         Serial.println("Could not add discovered receiver.");
@@ -371,39 +323,26 @@ void processDiscoveryResponse() {
     memcpy(receiverMAC, discoveredMAC, 6);
     receiverConnected = true;
 
-    Serial.printf(
-        "\nReceiver discovered: "
-        "%02X:%02X:%02X:%02X:%02X:%02X\n",
-        receiverMAC[0], receiverMAC[1], receiverMAC[2],
-        receiverMAC[3], receiverMAC[4], receiverMAC[5]
-    );
+    Serial.printf("\nReceiver discovered: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  receiverMAC[0], receiverMAC[1], receiverMAC[2],
+                  receiverMAC[3], receiverMAC[4], receiverMAC[5]);
 }
 
 // ---------- MPU READING ----------
 bool readMPU(int16_t &ax, int16_t &ay, int16_t &az,
              int16_t &gx, int16_t &gy, int16_t &gz,
              int16_t &temperature) {
-    if (!mpuInitialized) {
-        return false;
-    }
+    if (!mpuInitialized) return false;
 
     Wire.beginTransmission(mpuAddress);
     Wire.write(0x3B);
-
-    if (Wire.endTransmission(false) != 0) {
-        return false;
-    }
-
-    if (Wire.requestFrom(mpuAddress, (uint8_t)14) != 14) {
-        return false;
-    }
+    if (Wire.endTransmission(false) != 0) return false;
+    if (Wire.requestFrom(mpuAddress, (uint8_t)14) != 14) return false;
 
     ax = (int16_t)((Wire.read() << 8) | Wire.read());
     ay = (int16_t)((Wire.read() << 8) | Wire.read());
     az = (int16_t)((Wire.read() << 8) | Wire.read());
-
     temperature = (int16_t)((Wire.read() << 8) | Wire.read());
-
     gx = (int16_t)((Wire.read() << 8) | Wire.read());
     gy = (int16_t)((Wire.read() << 8) | Wire.read());
     gz = (int16_t)((Wire.read() << 8) | Wire.read());
@@ -420,13 +359,13 @@ float updateKalman(KalmanFilter &filter, float measurement,
     }
 
     filter.covariance += processNoise;
-    float gain = filter.covariance /
-                 (filter.covariance + measurementNoise);
+    float gain = filter.covariance / (filter.covariance + measurementNoise);
     filter.estimate += gain * (measurement - filter.estimate);
     filter.covariance *= 1.0f - gain;
     return filter.estimate;
 }
 
+// ---------- CALIBRATION ----------
 bool calibrateMPU() {
     if (!mpuInitialized) return false;
 
@@ -475,10 +414,9 @@ bool calibrateMPU() {
                              (GRAVITY / 2048.0f);
     }
 
-    float magnitude = sqrtf(
-        averageAccel[0] * averageAccel[0] +
-        averageAccel[1] * averageAccel[1] +
-        averageAccel[2] * averageAccel[2]);
+    float magnitude = sqrtf(averageAccel[0] * averageAccel[0] +
+                            averageAccel[1] * averageAccel[1] +
+                            averageAccel[2] * averageAccel[2]);
     uint8_t gravityAxis = 0;
     if (fabsf(averageAccel[1]) > fabsf(averageAccel[gravityAxis])) gravityAxis = 1;
     if (fabsf(averageAccel[2]) > fabsf(averageAccel[gravityAxis])) gravityAxis = 2;
@@ -491,10 +429,8 @@ bool calibrateMPU() {
         const float expectedGravityCounts =
             averageAccel[gravityAxis] >= 0.0f ? 2048.0f : -2048.0f;
         for (uint8_t axis = 0; axis < 3; axis++) {
-            float expectedCounts = axis == gravityAxis
-                ? expectedGravityCounts : 0.0f;
-            accelBiasRaw[axis] =
-                accelSum[axis] / IMU_CAL_SAMPLES - expectedCounts;
+            float expectedCounts = axis == gravityAxis ? expectedGravityCounts : 0.0f;
+            accelBiasRaw[axis] = accelSum[axis] / IMU_CAL_SAMPLES - expectedCounts;
         }
         Serial.println("Accelerometer single-position offset calibrated.");
     } else {
@@ -529,43 +465,58 @@ bool calibrateAltitudeZero() {
     return true;
 }
 
+// ---------- FLIGHT STATE ----------
+// Called once per NEW barometer sample (not on a fixed timer).
 void updateFlightState(uint32_t now) {
     if (flightState == STATE_STARTUP) return;
 
     if (!stateReferenceValid) {
-        previousStateAltitude = filteredAltitude;
-        previousStateTime = now;
+        previousSampleAltitude = filteredAltitude;
+        windowAltitude = filteredAltitude;
+        windowTime = now;
         maximumAltitude = filteredAltitude;
         stateReferenceValid = true;
         return;
     }
 
-    float dt = (uint32_t)(now - previousStateTime) / 1000.0f;
-    if (dt <= 0.0f) return;
-
-    float delta = filteredAltitude - previousStateAltitude;
-    float velocity = delta / dt;
-    previousStateAltitude = filteredAltitude;
-    previousStateTime = now;
+    // Per-sample change (used for apogee detection)
+    float delta = filteredAltitude - previousSampleAltitude;
+    previousSampleAltitude = filteredAltitude;
     if (filteredAltitude > maximumAltitude) maximumAltitude = filteredAltitude;
+
+    // Fixed-length window (used for boost velocity and landing detection)
+    bool windowReady = false;
+    float windowDelta = 0.0f;
+    float windowVelocity = 0.0f;
+    if ((uint32_t)(now - windowTime) >= STATE_WINDOW_MS) {
+        float windowDt = (uint32_t)(now - windowTime) / 1000.0f;
+        windowDelta = filteredAltitude - windowAltitude;
+        windowVelocity = windowDelta / windowDt;
+        windowAltitude = filteredAltitude;
+        windowTime = now;
+        windowReady = true;
+    }
 
     switch (flightState) {
         case STATE_ARMING:
-            if (velocity >= BOOST_VELOCITY_MPS &&
-                filteredAltitude >= BOOST_MIN_ALTITUDE_M) {
-                if (boostCount < UINT8_MAX) boostCount++;
-            } else {
-                boostCount = 0;
-            }
-            if (boostCount >= BOOST_CONFIRM_SAMPLES) {
-                flightState = STATE_BOOST;
-                descentCount = 0;
-                maximumAltitude = filteredAltitude;
-                Serial.println("FLIGHT STATE: BOOST");
+            if (windowReady) {
+                if (windowVelocity >= BOOST_VELOCITY_MPS &&
+                    filteredAltitude >= BOOST_MIN_ALTITUDE_M) {
+                    if (boostCount < UINT8_MAX) boostCount++;
+                } else {
+                    boostCount = 0;
+                }
+                if (boostCount >= BOOST_CONFIRM_WINDOWS) {
+                    flightState = STATE_BOOST;
+                    descentCount = 0;
+                    maximumAltitude = filteredAltitude;
+                    Serial.println("FLIGHT STATE: BOOST");
+                }
             }
             break;
 
         case STATE_BOOST:
+            // 20 consecutive decreasing altitude samples -> apogee
             if (delta < -ALTITUDE_DEADBAND_M) {
                 if (descentCount < UINT8_MAX) descentCount++;
             } else if (delta > ALTITUDE_DEADBAND_M) {
@@ -577,20 +528,22 @@ void updateFlightState(uint32_t now) {
                 digitalWrite(MOSFET_SIGNAL, HIGH);
                 apogeeSignalActive = true;
                 apogeeSignalStartTime = now;
-                Serial.println("FLIGHT STATE: APOGEE; GPIO26 HIGH");
+                Serial.println("FLIGHT STATE: APOGEE; GPIO26 HIGH (5 s)");
             }
             break;
 
         case STATE_APOGEE:
-            if (fabsf(delta) < LANDING_STABLE_BAND_M &&
-                maximumAltitude - filteredAltitude >= LANDING_MIN_DROP_M) {
-                if (stableCount < UINT16_MAX) stableCount++;
-            } else {
-                stableCount = 0;
-            }
-            if (stableCount >= LANDING_STABLE_SAMPLES) {
-                flightState = STATE_LANDING;
-                Serial.println("FLIGHT STATE: LANDING");
+            if (windowReady) {
+                if (fabsf(windowDelta) < LANDING_STABLE_BAND_M &&
+                    maximumAltitude - filteredAltitude >= LANDING_MIN_DROP_M) {
+                    if (stableCount < UINT16_MAX) stableCount++;
+                } else {
+                    stableCount = 0;
+                }
+                if (stableCount >= LANDING_STABLE_WINDOWS) {
+                    flightState = STATE_LANDING;
+                    Serial.println("FLIGHT STATE: LANDING");
+                }
             }
             break;
 
@@ -599,28 +552,24 @@ void updateFlightState(uint32_t now) {
     }
 }
 
+// ---------- SENSOR PROCESSING (runs every loop, no rate limit) ----------
 void updateSensorData() {
     int16_t ax, ay, az, gx, gy, gz, mpuTemperatureRaw;
-    filteredMPUValid = readMPU(ax, ay, az, gx, gy, gz,
-                               mpuTemperatureRaw);
+    filteredMPUValid = readMPU(ax, ay, az, gx, gy, gz, mpuTemperatureRaw);
 
     if (filteredMPUValid) {
         const float accelReadings[3] = {
-            ax - accelBiasRaw[0], ay - accelBiasRaw[1],
-            az - accelBiasRaw[2]
+            ax - accelBiasRaw[0], ay - accelBiasRaw[1], az - accelBiasRaw[2]
         };
         const float gyroReadings[3] = {
-            gx - gyroBiasRaw[0], gy - gyroBiasRaw[1],
-            gz - gyroBiasRaw[2]
+            gx - gyroBiasRaw[0], gy - gyroBiasRaw[1], gz - gyroBiasRaw[2]
         };
 
         for (uint8_t axis = 0; axis < 3; axis++) {
             filteredAccel[axis] = (int16_t)lroundf(
-                updateKalman(accelFilters[axis], accelReadings[axis],
-                             0.1f, 8.0f));
+                updateKalman(accelFilters[axis], accelReadings[axis], 0.1f, 8.0f));
             filteredGyro[axis] = (int16_t)lroundf(
-                updateKalman(gyroFilters[axis], gyroReadings[axis],
-                             0.1f, 8.0f));
+                updateKalman(gyroFilters[axis], gyroReadings[axis], 0.1f, 8.0f));
         }
 
         float mpuTemperature = mpuChipId == 0x70
@@ -630,33 +579,46 @@ void updateSensorData() {
             mpuTemperatureFilter, mpuTemperature, 0.01f, 0.5f);
     }
 
-    filteredBMPValid = false;
-    if (bmpInitialized) {
-        float temperature = bmp.readTemperature();
-        float pressure = bmp.readPressure();
-
-        if (isfinite(temperature) && isfinite(pressure) && pressure > 0.0f) {
-            float smoothTemperature = updateKalman(
-                temperatureFilter, temperature, 0.01f, 0.5f);
-            float smoothPressure = updateKalman(
-                pressureFilter, pressure, 0.25f, 25.0f);
-
-            if (smoothTemperature * 100.0f >= -32768.0f &&
-                smoothTemperature * 100.0f <= 32767.0f &&
-                smoothPressure > 0.0f &&
-                smoothPressure <= 4294967295.0f) {
-                filteredTemperature = (int16_t)lroundf(
-                    smoothTemperature * 100.0f);
-                filteredPressure = (uint32_t)lroundf(smoothPressure);
-                filteredBMPValid = true;
-            }
-        }
+    if (!bmpInitialized) {
+        filteredBMPValid = false;
+        return;
     }
 
-    if (filteredBMPValid && altitudeCalibrated) {
+    float temperature = bmp.readTemperature();
+    float pressure = bmp.readPressure();
+
+    if (!isfinite(temperature) || !isfinite(pressure) || pressure <= 0.0f) {
+        filteredBMPValid = false;
+        return;
+    }
+
+    // The loop runs faster than the barometer produces data. Only feed the
+    // filters and the flight-state logic when the reading actually changed,
+    // so duplicated readings do not skew the Kalman filter or the
+    // "20 decreasing samples" counter.
+    if (isfinite(lastRawPressure) && pressure == lastRawPressure) {
+        return;
+    }
+    lastRawPressure = pressure;
+
+    float smoothTemperature = updateKalman(temperatureFilter, temperature, 0.01f, 0.5f);
+    float smoothPressure = updateKalman(pressureFilter, pressure, 0.25f, 25.0f);
+
+    if (smoothTemperature * 100.0f >= -32768.0f &&
+        smoothTemperature * 100.0f <= 32767.0f &&
+        smoothPressure > 0.0f &&
+        smoothPressure <= 4294967295.0f) {
+        filteredTemperature = (int16_t)lroundf(smoothTemperature * 100.0f);
+        filteredPressure = (uint32_t)lroundf(smoothPressure);
+        filteredBMPValid = true;
+    } else {
+        filteredBMPValid = false;
+        return;
+    }
+
+    if (altitudeCalibrated) {
         float pressureRatio = filteredPressure / pressureZeroPa;
-        float rawAltitude = 44330.0f *
-            (1.0f - powf(pressureRatio, 0.19029495f));
+        float rawAltitude = 44330.0f * (1.0f - powf(pressureRatio, 0.19029495f));
         uint32_t now = millis();
 
         if (!altitudeFilterInitialized) {
@@ -667,8 +629,7 @@ void updateSensorData() {
             float dt = (uint32_t)(now - lastAltitudeFilterTime) / 1000.0f;
             if (dt <= 0.0f) dt = 0.001f;
             altitudeCovariance += ALTITUDE_KALMAN_Q * dt;
-            float gain = altitudeCovariance /
-                         (altitudeCovariance + ALTITUDE_KALMAN_R);
+            float gain = altitudeCovariance / (altitudeCovariance + ALTITUDE_KALMAN_R);
             filteredAltitude += gain * (rawAltitude - filteredAltitude);
             altitudeCovariance *= 1.0f - gain;
         }
@@ -678,45 +639,48 @@ void updateSensorData() {
     }
 }
 
-// ---------- TELEMETRY ----------
+// ---------- TELEMETRY (semicolon-separated text) ----------
+// Format:
+// magic;version;sequence;flight_state;mosfet_state;
+// mpu_x;mpu_y;mpu_z;gyro_x;gyro_y;gyro_z;
+// bmp_temperature_centi_c;pressure_pa;
+// latitude_e7;longitude_e7;gps_altitude_cm;gps_satellites;
+// flags;flight_state;relative_altitude_cm;mpu_temperature_centi_c
 bool sendTelemetry() {
-    TelemetryPacket packet = {};
-
-    packet.magic = MAGIC;
-    packet.version = TELEMETRY_VERSION;
-    packet.sequence = sequenceNumber++;
-    packet.uptime_ms = millis();
-    packet.flight_state = (uint8_t)flightState;
+    int16_t ax = 0, ay = 0, az = 0, gx = 0, gy = 0, gz = 0;
+    int16_t bmpTempCenti = 0, mpuTempCenti = 0;
+    uint32_t pressurePa = 0;
+    int32_t latE7 = 0, lonE7 = 0, gpsAltCm = 0, relAltCm = 0;
+    uint8_t satellites = 0;
+    uint8_t flags = 0;
 
     if (filteredMPUValid) {
-        packet.ax = filteredAccel[0];
-        packet.ay = filteredAccel[1];
-        packet.az = filteredAccel[2];
-        packet.gx = filteredGyro[0];
-        packet.gy = filteredGyro[1];
-        packet.gz = filteredGyro[2];
-        packet.flags |= FLAG_MPU_VALID;
+        ax = filteredAccel[0];
+        ay = filteredAccel[1];
+        az = filteredAccel[2];
+        gx = filteredGyro[0];
+        gy = filteredGyro[1];
+        gz = filteredGyro[2];
+        flags |= FLAG_MPU_VALID;
         if (isfinite(filteredMpuTemperature) &&
             filteredMpuTemperature * 100.0f >= -32768.0f &&
             filteredMpuTemperature * 100.0f <= 32767.0f) {
-            packet.mpu_temperature_centi_c = (int16_t)lroundf(
-                filteredMpuTemperature * 100.0f);
+            mpuTempCenti = (int16_t)lroundf(filteredMpuTemperature * 100.0f);
         }
     }
 
     if (filteredBMPValid) {
-        packet.temperature_centi_c = filteredTemperature;
-        packet.pressure_pa = filteredPressure;
-        packet.flags |= FLAG_BMP_VALID;
+        bmpTempCenti = filteredTemperature;
+        pressurePa = filteredPressure;
+        flags |= FLAG_BMP_VALID;
     }
 
     if (altitudeCalibrated && filteredBMPValid &&
         isfinite(filteredAltitude) &&
         filteredAltitude * 100.0f >= -2147483648.0f &&
         filteredAltitude * 100.0f <= 2147483647.0f) {
-        packet.relative_altitude_cm = (int32_t)lroundf(
-            filteredAltitude * 100.0f);
-        packet.flags |= FLAG_ALTITUDE_VALID;
+        relAltCm = (int32_t)lroundf(filteredAltitude * 100.0f);
+        flags |= FLAG_ALTITUDE_VALID;
     }
 
     if (gpsInitialized && gps.location.isValid() &&
@@ -725,35 +689,52 @@ bool sendTelemetry() {
         double longitude = gps.location.lng();
 
         if (isfinite(latitude) && isfinite(longitude)) {
-            packet.latitude_e7 = (int32_t)lround(latitude * 10000000.0);
-            packet.longitude_e7 = (int32_t)lround(longitude * 10000000.0);
-            packet.gps_altitude_cm =
-                gps.altitude.isValid() && isfinite(gps.altitude.meters())
-                    ? (int32_t)lround(gps.altitude.meters() * 100.0)
-                    : 0;
-            packet.gps_satellites = gps.satellites.isValid()
+            latE7 = (int32_t)lround(latitude * 10000000.0);
+            lonE7 = (int32_t)lround(longitude * 10000000.0);
+            gpsAltCm = gps.altitude.isValid() && isfinite(gps.altitude.meters())
+                ? (int32_t)lround(gps.altitude.meters() * 100.0)
+                : 0;
+            satellites = gps.satellites.isValid()
                 ? (uint8_t)gps.satellites.value()
                 : 0;
-            packet.flags |= FLAG_GPS_VALID;
+            flags |= FLAG_GPS_VALID;
         }
     }
 
-    esp_err_t result = esp_now_send(
-        receiverMAC,
-        (const uint8_t *)&packet,
-        sizeof(packet)
-    );
+    const uint8_t mosfetState = apogeeSignalActive ? 1 : 0;
 
-    if (result != ESP_OK) {
-        Serial.printf("Telemetry send failed: %s\n",
-                      esp_err_to_name(result));
+    char buffer[250];
+    int length = snprintf(
+        buffer, sizeof(buffer),
+        "%08lX;%u;%u;%u;%u;%d;%d;%d;%d;%d;%d;%d;%lu;%ld;%ld;%ld;%u;%u;%u;%ld;%d",
+        (unsigned long)MAGIC,
+        (unsigned)TELEMETRY_VERSION,
+        (unsigned)sequenceNumber++,
+        (unsigned)flightState,
+        (unsigned)mosfetState,
+        ax, ay, az,
+        gx, gy, gz,
+        bmpTempCenti,
+        (unsigned long)pressurePa,
+        (long)latE7, (long)lonE7, (long)gpsAltCm,
+        (unsigned)satellites,
+        (unsigned)flags,
+        (unsigned)flightState,
+        (long)relAltCm,
+        mpuTempCenti);
+
+    if (length <= 0 || length >= (int)sizeof(buffer)) {
+        Serial.println("Telemetry string too long.");
         return false;
     }
 
-    if (flightState == STATE_STARTUP) {
-        flightState = STATE_ARMING;
-        Serial.println("FLIGHT STATE: ARMING");
+    esp_err_t result = esp_now_send(receiverMAC, (const uint8_t *)buffer, length);
+
+    if (result != ESP_OK) {
+        Serial.printf("Telemetry send failed: %s\n", esp_err_to_name(result));
+        return false;
     }
+
     return true;
 }
 
@@ -762,15 +743,15 @@ void setup() {
     Serial.begin(115200);
     delay(500);
 
-    digitalWrite(MOSFET_SIGNAL, LOW);
     pinMode(MOSFET_SIGNAL, OUTPUT);
+    digitalWrite(MOSFET_SIGNAL, LOW);
     flightState = STATE_STARTUP;
 
     Serial.println("\n=== ESP-NOW ROCKET AVIONICS ===");
     Serial.println("Flight state: STARTUP");
 
     Wire.begin(SDA_PIN, SCL_PIN);
-    Wire.setClock(100000);
+    Wire.setClock(400000);
 
     initializeMPU();
     initializeBMP();
@@ -790,75 +771,60 @@ void setup() {
     Serial.println(WiFi.macAddress());
 
     esp_err_t channelResult =
-        esp_wifi_set_channel(
-            ESPNOW_CHANNEL,
-            WIFI_SECOND_CHAN_NONE
-        );
-
+        esp_wifi_set_channel(ESPNOW_CHANNEL, WIFI_SECOND_CHAN_NONE);
     if (channelResult != ESP_OK) {
-        Serial.printf("Channel setup failed: %s\n",
-                      esp_err_to_name(channelResult));
+        Serial.printf("Channel setup failed: %s\n", esp_err_to_name(channelResult));
     }
 
     if (esp_now_init() != ESP_OK) {
         Serial.println("ESP-NOW initialization failed!");
-        while (true) {
-            delay(1000);
-        }
+        while (true) delay(1000);
     }
 
     if (!addPeer(broadcastMAC)) {
         Serial.println("Could not add broadcast peer.");
-        while (true) {
-            delay(1000);
-        }
+        while (true) delay(1000);
     }
 
     esp_now_register_recv_cb(onReceive);
+
+    // Arm as soon as the altitude reference is valid. Flight logic no
+    // longer depends on the radio link being up.
+    if (altitudeCalibrated) {
+        flightState = STATE_ARMING;
+        Serial.println("FLIGHT STATE: ARMING");
+    }
 
     Serial.println("Waiting for receiver discovery...");
 }
 
 // ---------- LOOP ----------
 void loop() {
-    processDiscoveryResponse();
+    uint32_t now = millis();
+
+    // Data processing: runs every pass, no rate limit.
     updateGPS();
+    updateSensorData();
 
-    unsigned long now = millis();
-
-    if (now - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL_MS) {
-        lastSensorUpdate = now;
-        updateSensorData();
-    }
-
+    // MOSFET off after 5 s.
     if (apogeeSignalActive &&
-        (uint32_t)(now - apogeeSignalStartTime) >=
-            APOGEE_SIGNAL_DURATION_MS) {
+        (uint32_t)(now - apogeeSignalStartTime) >= APOGEE_SIGNAL_DURATION_MS) {
         digitalWrite(MOSFET_SIGNAL, LOW);
         apogeeSignalActive = false;
         Serial.println("GPIO26 apogee signal LOW");
     }
 
+    processDiscoveryResponse();
+
+    // Radio: discovery or telemetry at 1 Hz. Never blocks processing.
     if (!receiverConnected) {
         if (now - lastDiscovery >= DISCOVERY_INTERVAL_MS) {
             lastDiscovery = now;
 
-            ControlMessage discovery = {
-                MAGIC,
-                MSG_DISCOVERY,
-                VERSION
-            };
-
-            esp_now_send(
-                broadcastMAC,
-                (const uint8_t *)&discovery,
-                sizeof(discovery)
-            );
-
+            ControlMessage discovery = {MAGIC, MSG_DISCOVERY, VERSION};
+            esp_now_send(broadcastMAC, (const uint8_t *)&discovery, sizeof(discovery));
             Serial.println("Searching for receiver...");
         }
-
-        delay(5);
         return;
     }
 
